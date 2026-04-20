@@ -1,0 +1,2 @@
+pip install "langchain-google-vertexai==2.0.28"
+pip install pgvector

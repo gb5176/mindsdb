@@ -17,12 +17,33 @@ Before proceeding, ensure the following prerequisites are met:
 
 Create an AI engine from the [Google Gemini handler](https://github.com/mindsdb/mindsdb/tree/main/mindsdb/integrations/handlers/google_gemini_handler).
 
+### Authentication with API Key
+
 ```sql
 CREATE ML_ENGINE google_gemini_engine
 FROM google_gemini
 USING
       api_key = 'api-key-value';
 ```
+
+### Authentication with Service Account (Enterprise)
+
+For production/enterprise environments using Google Cloud service accounts:
+
+```sql
+CREATE ML_ENGINE google_gemini_engine
+FROM google_gemini
+USING
+      service_account_json = '/path/to/service-account-key.json';
+```
+
+You can also provide the service account JSON as a dictionary or set the `GOOGLE_APPLICATION_CREDENTIALS` environment variable.
+
+**Authentication Priority:**
+1. Service account credentials (if provided)
+2. API key (if no service account specified)
+
+**Note:** Service account must have `Generative Language API` permissions.
 
 ## Example Usage
 

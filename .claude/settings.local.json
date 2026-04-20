@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(c:/Gourav/Workspace/o-workspace/mindsdb/mindsdb-venv/Scripts/pip show *)"
+    ]
+  }
+}

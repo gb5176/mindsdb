@@ -1,13 +1,23 @@
 import os
 from typing import Dict, Optional
 
+# Configure SSL certificates BEFORE any imports that use gRPC/SSL
+# This fixes CERTIFICATE_VERIFY_FAILED errors in Windows/corporate environments
+import certifi
+os.environ['SSL_CERT_FILE'] = certifi.where()
+os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
+os.environ['GRPC_DEFAULT_SSL_ROOTS_FILE_PATH'] = certifi.where()
+
 from PIL import Image
 import requests
 import numpy as np
 from io import BytesIO
 import json
 import textwrap
-import google.generativeai as genai
+from google import genai
+from google.genai import types
+from google.oauth2 import service_account
+from google.auth import default as google_auth_default
 import pandas as pd
 from mindsdb.integrations.libs.base import BaseMLEngine
 from mindsdb.utilities import log
@@ -102,6 +112,7 @@ class GoogleGeminiHandler(BaseMLEngine):
                 "max_tokens",
                 "temperature",
                 "api_key",
+                "service_account_json",
             }
         )
 
@@ -218,17 +229,136 @@ class GoogleGeminiHandler(BaseMLEngine):
         # remove prompts without signal from completion queue
         prompts = [j for i, j in enumerate(prompts) if i not in empty_prompt_ids]
 
-        api_key = self._get_google_gemini_api_key(args)
-        genai.configure(api_key=api_key)
+        client = self._configure_genai(args)
 
-        # called gemini model withinputs
-        model = genai.GenerativeModel(args.get("model_name", self.default_model))
+        # called gemini model with inputs
+        model_name = args.get("model_name", self.default_model)
         results = []
+        prompt_tokens_list = []
+        completion_tokens_list = []
+        total_tokens_list = []
         for m in prompts:
-            results.append(model.generate_content(m).text)
+            import time
+            time.sleep(40)
+            response = client.models.generate_content(
+                model=model_name,
+                contents=m
+            )
+            results.append(response.text)
+            um = response.usage_metadata
+            if um:
+                prompt_tokens_list.append(getattr(um, 'prompt_token_count', 0) or 0)
+                completion_tokens_list.append(getattr(um, 'candidates_token_count', 0) or 0)
+                total_tokens_list.append(getattr(um, 'total_token_count', 0) or 0)
+            else:
+                prompt_tokens_list.append(0)
+                completion_tokens_list.append(0)
+                total_tokens_list.append(0)
 
         pred_df = pd.DataFrame(results, columns=[args["target"]])
+        pred_df['__prompt_tokens__'] = prompt_tokens_list
+        pred_df['__completion_tokens__'] = completion_tokens_list
+        pred_df['__total_tokens__'] = total_tokens_list
         return pred_df
+
+    def _get_service_account_credentials(self, args):
+        """
+        Load service account credentials from JSON file or dict.
+        Preference order:
+            1. provided at model creation (service_account_json)
+            2. provided at engine creation
+            3. GOOGLE_APPLICATION_CREDENTIALS env variable
+        """
+        service_account_json = None
+        
+        # 1. Check model creation args
+        if "service_account_json" in args:
+            service_account_json = args["service_account_json"]
+        
+        # 2. Check engine creation args
+        if service_account_json is None:
+            connection_args = self.engine_storage.get_connection_args()
+            if "service_account_json" in connection_args:
+                service_account_json = connection_args["service_account_json"]
+        
+        # 3. Check environment variable
+        if service_account_json is None:
+            creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+            if creds_path and os.path.exists(creds_path):
+                service_account_json = creds_path
+        
+        if service_account_json is None:
+            return None
+        
+        # Load credentials from file path or dict
+        if isinstance(service_account_json, str):
+            # Check if it's a file path
+            if os.path.exists(service_account_json):
+                credentials = service_account.Credentials.from_service_account_file(
+                    service_account_json,
+                    scopes=['https://www.googleapis.com/auth/cloud-platform']
+                )
+                return credentials
+            else:
+                # Try parsing as JSON string
+                try:
+                    service_account_dict = json.loads(service_account_json)
+                    credentials = service_account.Credentials.from_service_account_info(
+                        service_account_dict,
+                        scopes=['https://www.googleapis.com/auth/cloud-platform']
+                    )
+                    return credentials
+                except json.JSONDecodeError:
+                    raise Exception(f"service_account_json path does not exist: {service_account_json}")
+        elif isinstance(service_account_json, dict):
+            # If it's already a dictionary
+            credentials = service_account.Credentials.from_service_account_info(
+                service_account_json,
+                scopes=['https://www.googleapis.com/auth/cloud-platform']
+            )
+            return credentials
+        
+        return None
+
+    def _configure_genai(self, args):
+        """
+        Configure Google Generative AI with either API key or service account credentials.
+        Service account takes precedence over API key if both are provided.
+        Note: SSL certificates are configured at module level to fix CERTIFICATE_VERIFY_FAILED errors.
+        Returns a genai.Client instance.
+        """
+        # Try service account first
+        credentials = self._get_service_account_credentials(args)
+        if credentials:
+            # With service account, we need to use Vertex AI mode
+            connection_args = self.engine_storage.get_connection_args()
+            
+            # Extract project from credentials or engine args
+            if hasattr(credentials, 'project_id') and credentials.project_id:
+                project = credentials.project_id
+            elif hasattr(credentials, '_project_id') and credentials._project_id:
+                project = credentials._project_id
+            else:
+                # Try to get from engine args
+                project = connection_args.get('project')
+                if not project:
+                    raise Exception("Cannot determine project_id from service account. Please provide 'project' in engine creation.")
+            
+            location = args.get('location', connection_args.get('location', 'global'))
+            
+            # Set credentials as environment default so genai client can use them
+            import google.auth
+            google.auth.default = lambda scopes=None, **kwargs: (credentials, project)
+            
+            return genai.Client(
+                vertexai=True,
+                project=project,
+                location=location
+            )
+        
+        # Fall back to API key for Google AI API
+        api_key = self._get_google_gemini_api_key(args)
+        return genai.Client(api_key=api_key)
 
     def _get_google_gemini_api_key(self, args, strict=True):
         """
@@ -269,8 +399,7 @@ class GoogleGeminiHandler(BaseMLEngine):
             else:
                 titles = None
 
-            api_key = self._get_google_gemini_api_key(args)
-            genai.configure(api_key=api_key)
+            client = self._configure_genai(args)
             model_name = args.get("model_name", self.default_embedding_model)
             task_type = args.get("type")
             task_type = f"retrieval_{task_type}"
@@ -278,30 +407,30 @@ class GoogleGeminiHandler(BaseMLEngine):
             if task_type == "retrieval_query":
                 results = [
                     str(
-                        genai.embed_content(
+                        client.models.embed_content(
                             model=model_name, content=query, task_type=task_type
-                        )["embedding"]
+                        ).values
                     )
                     for query in prompts
                 ]
             elif titles:
                 results = [
                     str(
-                        genai.embed_content(
+                        client.models.embed_content(
                             model=model_name,
                             content=doc,
                             task_type=task_type,
                             title=title,
-                        )["embedding"]
+                        ).values
                     )
                     for title, doc in zip(titles, prompts)
                 ]
             else:
                 results = [
                     str(
-                        genai.embed_content(
+                        client.models.embed_content(
                             model=model_name, content=doc, task_type=task_type
-                        )["embedding"]
+                        ).values
                     )
                     for doc in prompts
                 ]
@@ -332,20 +461,26 @@ class GoogleGeminiHandler(BaseMLEngine):
         if args.get("ctx_column"):
             prompts = list(df[args["ctx_column"]].apply(lambda x: str(x)))
 
-        api_key = self._get_google_gemini_api_key(args)
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-pro-vision")
+        client = self._configure_genai(args)
         with concurrent.futures.ThreadPoolExecutor() as executor:
             # Download images concurrently using ThreadPoolExecutor
             imgs = list(executor.map(get_img, urls))
         # imgs = [Image.open(BytesIO(requests.get(url).content)) for url in urls]
         if prompts:
             results = [
-                model.generate_content([img, text]).text
+                client.models.generate_content(
+                    model="gemini-pro-vision",
+                    contents=[{'image': img}, {'text': text}]
+                ).text
                 for img, text in zip(imgs, prompts)
             ]
         else:
-            results = [model.generate_content(img).text for img in imgs]
+            results = [
+                client.models.generate_content(
+                    model="gemini-pro-vision",
+                    contents=[{'image': img}]
+                ).text for img in imgs
+            ]
 
         pred_df = pd.DataFrame(results, columns=[args["target"]])
 
@@ -359,12 +494,11 @@ class GoogleGeminiHandler(BaseMLEngine):
         if attribute == "args":
             return pd.DataFrame(args.items(), columns=["key", "value"])
         elif attribute == "metadata":
-            api_key = self._get_google_gemini_api_key(args)
-            genai.configure(api_key=api_key)
+            client = self._configure_genai(args)
             model_name = args.get("model_name", self.default_model)
 
-            meta = genai.get_model(f"models/{model_name}").__dict__
-            return pd.DataFrame(meta.items(), columns=["key", "value"])
+            meta = client.models.get(model=f"models/{model_name}")
+            return pd.DataFrame([["model_name", model_name], ["info", str(meta)]], columns=["key", "value"])
         else:
             tables = ["args", "metadata"]
             return pd.DataFrame(tables, columns=["tables"])

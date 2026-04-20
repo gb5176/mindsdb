@@ -861,7 +861,16 @@ class MysqlProxy(SocketServer.BaseRequestHandler):
         if cert_path is None or cert_path == "":
             cert_path = tempfile.mkstemp(prefix="mindsdb_cert_", text=True)[1]
             make_ssl_cert(cert_path)
-            atexit.register(lambda: os.remove(cert_path))
+            
+            def cleanup_cert():
+                try:
+                    os.remove(cert_path)
+                except (PermissionError, OSError) as e:
+                    # On Windows, file may still be in use during shutdown
+                    # Ignore the error as temp files will be cleaned up by OS
+                    logger.debug(f"Could not remove temporary certificate file: {e}")
+            
+            atexit.register(cleanup_cert)
         elif not os.path.exists(cert_path):
             logger.error("Certificate defined in 'certificate_path' setting does not exist")
 
