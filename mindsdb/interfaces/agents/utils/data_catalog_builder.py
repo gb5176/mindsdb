@@ -95,16 +95,21 @@ def dataframe_to_markdown(df: pd.DataFrame) -> str:
 class DataCatalogBuilder:
     """Builds and caches data catalogs for agent data sources"""
 
-    def __init__(self, sql_toolkit, disable_cache: bool = True):
+    def __init__(self, sql_toolkit, disable_cache: bool = False, sample_rows: int = 5, include_metadata: bool = True):
         """
         Initialize data catalog builder.
 
         Args:
-            disable_cache: If True, disable caching for all catalog operations (default: False)
+            disable_cache: If True, disable caching for all catalog operations.
+            sample_rows: Number of sample rows per table. Set to 0 to skip sample
+                         data entirely (column schema is still shown).
+            include_metadata: If False, skip SHOW COLUMNS fetch (use when KBs supply column info).
         """
         self.sql_toolkit = sql_toolkit
         self.cache = get_cache("agent", max_size=_MAX_CACHE_SIZE)
         self.disable_cache = disable_cache
+        self.sample_rows = sample_rows
+        self.include_metadata = include_metadata
 
     def _get_cache_key(
         self,
@@ -164,24 +169,30 @@ class DataCatalogBuilder:
         if schema is None:
             schema = "mindsdb"
 
-        # Get sample data
-        sample_data_query = Select(targets=[Star()], from_table=table, limit=Constant(5))
-        try:
-            result = self.sql_toolkit.execute(sample_data_query)
-            sample_data_csv = self._dataframe_to_csv(result)
-        except Exception as e:
-            logger.warning(f"Error getting sample data for table {table}: {e}")
-            sample_data_csv = f"Error retrieving sample data: {str(e)}"
+        # Get sample data (skip entirely when sample_rows=0 to save LLM tokens)
+        if self.sample_rows > 0:
+            sample_data_query = Select(targets=[Star()], from_table=table, limit=Constant(self.sample_rows))
+            try:
+                result = self.sql_toolkit.execute(sample_data_query)
+                sample_data_csv = self._dataframe_to_csv(result)
+            except Exception as e:
+                logger.warning(f"Error getting sample data for table {table}: {e}")
+                sample_data_csv = f"Error retrieving sample data: {str(e)}"
+        else:
+            sample_data_query = Select(targets=[Star()], from_table=table, limit=Constant(1))
+            sample_data_csv = ""  # skipped to reduce tokens; use kb_query_tool for schema details
 
-        # Get metadata
-        # Query information_schema.columns for table metadata
-        metadata_query = Show(category="columns", from_table=table)
-        try:
-            result = self.sql_toolkit.execute(metadata_query)
-            logger.debug(f"result: {result}")
-            metadata_csv = self._dataframe_to_csv(result)
-        except Exception as e:
-            logger.warning(f"Error getting metadata for table {table}: {e}")
+        # Get metadata (skipped when include_metadata=False, e.g. when KBs supply column info)
+        if self.include_metadata:
+            metadata_query = Show(category="columns", from_table=table)
+            try:
+                result = self.sql_toolkit.execute(metadata_query)
+                logger.debug(f"result: {result}")
+                metadata_csv = self._dataframe_to_csv(result)
+            except Exception as e:
+                logger.warning(f"Error getting metadata for table {table}: {e}")
+                metadata_csv = None
+        else:
             metadata_csv = None
 
         return {
@@ -288,7 +299,8 @@ class DataCatalogBuilder:
                     info = []
                     info.append(f"\n--- Table: {table} ---")
                     info.append(f"Sample Data Query:\n{entry['sample_data_query']}")
-                    info.append(f"Sample Data (csv):\n{entry['sample_data']}")
+                    if entry["sample_data"]:
+                        info.append(f"Sample Data (csv):\n{entry['sample_data']}")
                     if entry["metadata"] is not None:
                         info.append(f"Metadata (csv):\n{entry['metadata']}")
                     catalog = "\n".join(info)

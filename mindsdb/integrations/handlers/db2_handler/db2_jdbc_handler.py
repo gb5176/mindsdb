@@ -221,19 +221,34 @@ class DB2JDBCHandler(DatabaseHandler):
         )
         
         # Step 2: Replace backtick-quoted schema.table patterns with uppercase unquoted versions
-        # Pattern: `schema`.`table` → SCHEMA.TABLE
+        # Pattern: `schema`.`table` → SCHEMA.TABLE  (case-insensitive to handle uppercase identifiers)
         query_str = re.sub(
-            r'`([a-z_][a-z0-9_]*)`\.`([a-z_][a-z0-9_]*)`',
+            r'`([a-zA-Z_][a-zA-Z0-9_]*)`\.`([a-zA-Z_][a-zA-Z0-9_]*)`',
             lambda m: f"{m.group(1).upper()}.{m.group(2).upper()}",
             query_str
         )
-        
+
         # Step 3: Replace remaining standalone backtick-quoted identifiers with uppercase
-        # Pattern: `identifier` → IDENTIFIER
+        # Pattern: `identifier` → IDENTIFIER  (case-insensitive to handle uppercase identifiers)
         query_str = re.sub(
-            r'`([a-z_][a-z0-9_]*)`',
+            r'`([a-zA-Z_][a-zA-Z0-9_]*)`',
             lambda m: m.group(1).upper(),
             query_str
+        )
+
+        # Step 4: Convert LIMIT N / LIMIT N OFFSET M to DB2 syntax (FETCH FIRST N ROWS ONLY)
+        # MindsDB appends LIMIT N to queries; DB2 does not support LIMIT syntax
+        def _limit_to_fetch_first(m):
+            n, offset = m.group(1), m.group(2)
+            if offset:
+                return f"OFFSET {offset} ROWS FETCH FIRST {n} ROWS ONLY"
+            return f"FETCH FIRST {n} ROWS ONLY"
+
+        query_str = re.sub(
+            r'\bLIMIT\s+(\d+)(?:\s+OFFSET\s+(\d+))?',
+            _limit_to_fetch_first,
+            query_str,
+            flags=re.IGNORECASE,
         )
         
         logger.info(f"Rendered SQL query for DB2: {query_str}")

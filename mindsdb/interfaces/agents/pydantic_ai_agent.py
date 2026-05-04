@@ -93,6 +93,15 @@ class PydanticAIAgent:
 
         self.langfuse_client_wrapper = LangfuseClientWrapper()
         self.agent_mode = self.agent.params.get("mode", "text")
+        # Target SQL dialect for the returned query: "db2", "mysql", "postgres", "mindsdb" (default).
+        # When set to any value other than "mindsdb", the final SQL is returned as text (not executed)
+        # with dialect-specific transformations applied.  "mindsdb" (or absent) preserves normal
+        # execute-and-return-data behaviour.
+        self.sql_dialect = self.agent.params.get("sql_dialect", None)
+        # return_sql_only: skip execution and return the SQL as the answer.
+        # Auto-enabled when mode=sql (existing behaviour) OR when sql_dialect is explicitly set.
+        _dialect_implies_sql = self.sql_dialect is not None and self.sql_dialect != "mindsdb"
+        self.return_sql_only = self.agent.params.get("return_sql", self.agent_mode == "sql" or _dialect_implies_sql)
 
         self.llm_params = llm_params
 
@@ -100,8 +109,30 @@ class PydanticAIAgent:
         self.model_instance = get_model_instance_from_kwargs(self.llm_params)
 
         # Command executor for queries
-        tables_list = self.agent.params.get("data", {}).get("tables", [])
-        knowledge_bases_list = self.agent.params.get("data", {}).get("knowledge_bases", [])
+        tables_list = list(self.agent.params.get("data", {}).get("tables", []))
+        knowledge_bases_list = list(self.agent.params.get("data", {}).get("knowledge_bases", []))
+
+        # Bridge legacy skills-based config to the new data format.
+        # text2sql skills → tables_list; retrieval skills → knowledge_bases_list
+        for rel in getattr(self.agent, 'skills_relationships', []):
+            skill = rel.skill
+            if skill.type == 'text2sql':
+                db_name = skill.params.get('database', '')
+                for t in skill.params.get('tables', []):
+                    if isinstance(t, dict):
+                        schema = t.get('schema', '')
+                        table = t.get('table', '')
+                        if db_name and schema and table:
+                            tables_list.append(f'{db_name}.{schema}.{table}')
+                        elif db_name and table:
+                            tables_list.append(f'{db_name}.{table}')
+                    elif isinstance(t, str):
+                        tables_list.append(f'{db_name}.{t}' if db_name else t)
+            elif skill.type == 'retrieval':
+                source = skill.params.get('source', '')
+                if source and source not in knowledge_bases_list:
+                    knowledge_bases_list.append(source)
+
         self.sql_toolkit = MindsDBQuery(tables_list, knowledge_bases_list)
 
         self.system_prompt = self.agent.params.get("prompt_template", "You are an expert MindsDB SQL data analyst")
@@ -380,12 +411,72 @@ class PydanticAIAgent:
                             # try to find case independent
                             if col.lower() in cols_map:
                                 data[col] = data[cols_map[col.lower()]]
+                            elif len(data.columns) == 1:
+                                # Single-column result whose alias was stripped by the DB driver —
+                                # use it as the value for the expected target column.
+                                data[col] = data.iloc[:, 0]
                             else:
                                 data[col] = None
                     # Reorder columns to match select_targets order
                     data = data[self.select_targets]
 
             return data
+
+    @staticmethod
+    def _to_db2_sql(sql: str) -> str:
+        """Apply DB2-compatible transformations to a raw SQL string.
+
+        Mirrors the regex pipeline in DB2JDBCHandler.query() so the returned SQL
+        is ready to run directly against a DB2 database without further processing:
+          - strip MindsDB connection-name prefix from table references
+          - remove backtick quoting, uppercase identifiers
+          - convert LIMIT N to FETCH FIRST N ROWS ONLY
+        """
+        import re
+
+        # 1. Remove MindsDB connection-name prefix: `aar_db2`.`SCHEMA`.`TABLE` → `SCHEMA`.`TABLE`
+        #    Pattern matches a lowercase_with_underscores name followed by a dot.
+        sql = re.sub(r'`?[a-z_][a-z0-9_]*_connection[a-z0-9_]*`?\.', '', sql, flags=re.IGNORECASE)
+
+        # 2. Replace backtick schema.table pairs → SCHEMA.TABLE (uppercase, no quotes)
+        sql = re.sub(
+            r'`([a-zA-Z_][a-zA-Z0-9_]*)`\.`([a-zA-Z_][a-zA-Z0-9_]*)`',
+            lambda m: f"{m.group(1).upper()}.{m.group(2).upper()}",
+            sql,
+        )
+
+        # 3. Replace remaining standalone backtick-quoted identifiers → UPPERCASE unquoted
+        sql = re.sub(r'`([a-zA-Z_][a-zA-Z0-9_]*)`', lambda m: m.group(1).upper(), sql)
+
+        # 4. Convert LIMIT N [OFFSET M] → FETCH FIRST N ROWS ONLY
+        def _limit_to_fetch(m):
+            n, offset = m.group(1), m.group(2)
+            if offset:
+                return f"OFFSET {offset} ROWS FETCH FIRST {n} ROWS ONLY"
+            return f"FETCH FIRST {n} ROWS ONLY"
+
+        sql = re.sub(
+            r'\bLIMIT\s+(\d+)(?:\s+OFFSET\s+(\d+))?',
+            _limit_to_fetch,
+            sql,
+            flags=re.IGNORECASE,
+        )
+        return sql.strip()
+
+    def _apply_sql_dialect(self, sql: str) -> str:
+        """Transform *sql* into the target dialect specified by self.sql_dialect.
+
+        Supported values:
+          "db2"      – IBM DB2 (FETCH FIRST, uppercase identifiers, no backticks)
+          "mindsdb"  – no transformation (return as-is)
+          None       – no transformation (return as-is)
+
+        Additional dialects ("mysql", "postgres", etc.) can be added here.
+        """
+        if self.sql_dialect == "db2":
+            return self._to_db2_sql(sql)
+        # "mindsdb", None, or any unknown value → return unchanged
+        return sql
 
     def _create_error_response(self, error_message: str, return_context: bool = True) -> pd.DataFrame:
         """Create error response DataFrame"""
@@ -396,6 +487,39 @@ class PydanticAIAgent:
         if return_context:
             response_data[CONTEXT_COLUMN] = [json.dumps([])]
         return pd.DataFrame(response_data)
+
+    def _fetch_kb_context(self, question: str) -> str:
+        """Semantic pre-fetch from all KBs using the user's question.
+
+        Returns relevant KB chunks (content only, truncated) for the planning prompt.
+        Capped at 3000 chars total to avoid bloating the planning prompt.
+        """
+        _MAX_CHUNK_CHARS = 300  # truncate each chunk to keep snippets concise
+        _MAX_TOTAL_CHARS = 3000  # hard cap on total injected KB context
+        parts = []
+        for kb in self.sql_toolkit.get_usable_knowledge_base_names():
+            kb_query = ast.Select(
+                targets=[ast.Star()],
+                from_table=kb,
+                where=ast.BinaryOperation("LIKE", args=[ast.Identifier("content"), ast.Constant(question)]),
+                limit=ast.Constant(5),
+            )
+            try:
+                result = self.sql_toolkit.execute(kb_query)
+                if result is not None and not result.empty:
+                    # Only show the content column — skip id/metadata columns to save tokens
+                    content_col = next(
+                        (c for c in result.columns if c.lower() in ("chunk_content", "content")),
+                        result.columns[0],
+                    )
+                    snippets = [str(v)[:_MAX_CHUNK_CHARS] for v in result[content_col] if v is not None]
+                    parts.append(f"--- {kb} ---\n" + "\n\n".join(snippets))
+            except Exception as e:
+                logger.debug(f"KB pre-fetch failed for {kb}: {e}")
+        full = "\n\n".join(parts)
+        if len(full) > _MAX_TOTAL_CHARS:
+            full = full[:_MAX_TOTAL_CHARS] + "\n... (truncated)"
+        return full
 
     @langfuse_traced_stream(trace_name="api-completion", span_name="run-completion")
     def _get_completion_stream(self, messages: List[dict], params) -> Iterable[Dict]:
@@ -431,7 +555,16 @@ class PydanticAIAgent:
         else:
             sql_instructions = agent_prompts.sql_description
 
-        data_catalog = DataCatalogBuilder(sql_toolkit=self.sql_toolkit).build_data_catalog()
+        # When KBs are present: use fewer sample rows and skip SHOW COLUMNS metadata
+        # (the KB pre-fetch below supplies focused column info, avoiding ~500 tokens/table overhead).
+        _has_kbs = bool(self.sql_toolkit.knowledge_bases)
+        _sample_rows = 3 if _has_kbs else 5
+        _include_metadata = not _has_kbs
+        data_catalog = DataCatalogBuilder(
+            sql_toolkit=self.sql_toolkit,
+            sample_rows=_sample_rows,
+            include_metadata=_include_metadata,
+        ).build_data_catalog()
 
         # Initialize counters and accumulators
         exploratory_query_count = 0
@@ -447,6 +580,15 @@ class PydanticAIAgent:
 
         # Build planning prompt
         planning_prompt_text = f"""Take into account the following Data Catalog:\n{data_catalog}\n\n{agent_prompts.planning_prompt}\n\nQuestion to answer: {current_prompt}"""
+
+        # When KBs are present, pre-fetch relevant schema/column context and inject into the planning prompt.
+        # This makes KBs actively useful for the planning step and compensates for skipping SHOW COLUMNS above.
+        if _has_kbs:
+            yield self._add_chunk_metadata({"type": "status", "content": "Querying knowledge bases for schema context..."})
+            kb_context = self._fetch_kb_context(current_prompt)
+            if kb_context:
+                planning_prompt_text += f"\n\n=== Knowledge Base Context (schema / column info) ===\n{kb_context}"
+                logger.info(f"KB pre-fetch injected {len(kb_context)} chars into planning prompt")
         DEBUG_LOGGER(f"PydanticAIAgent._get_completion_stream: Planning prompt text: {planning_prompt_text}")
         # Get select targets for planning context
 
@@ -457,6 +599,8 @@ class PydanticAIAgent:
 
         # Generate plan
         plan_result = planning_agent.run_sync(planning_prompt_text)
+        _pu = plan_result.usage()
+        logger.info(f"[TOKEN USAGE] planning: request={_pu.request_tokens}, response={_pu.response_tokens}, total={_pu.total_tokens}, details={_pu.details}")
         plan = plan_result.output
         # Validate plan steps don't exceed MAX_EXPLORATORY_QUERIES
         if plan.estimated_steps > MAX_EXPLORATORY_QUERIES:
@@ -479,6 +623,38 @@ class PydanticAIAgent:
 
         # Build base prompt with plan included
         base_prompt = f"\n\nTake into account the following Data Catalog:\n{data_catalog}\nMindsDB SQL instructions:\n{sql_instructions}\n\nProposed Execution Plan:\n{plan.plan}\n\nEstimated steps: {plan.estimated_steps} (maximum allowed: {MAX_EXPLORATORY_QUERIES})\n\nPlease follow this plan and write Mindsdb SQL queries to answer the question:\n{current_prompt}"
+
+        if self.return_sql_only:
+            _dialect_instructions = {
+                "db2": (
+                    "DB2 SQL rules you must follow:\n"
+                    "  - Use FETCH FIRST N ROWS ONLY instead of LIMIT N\n"
+                    "  - Never use backtick quotes (`) for identifiers — use plain uppercase names\n"
+                    "  - Table names must be fully qualified as SCHEMA.TABLE (e.g. COGUSER.RAR_PROJECT)\n"
+                    "  - Do NOT include the MindsDB connection name prefix "
+                    "(e.g. aar_db2.COGUSER.TABLE is WRONG — use COGUSER.TABLE)\n"
+                    "  - Use standard SQL JOIN syntax; no MindsDB-specific extensions"
+                ),
+                "mysql": (
+                    "MySQL SQL rules you must follow:\n"
+                    "  - Use LIMIT N for row limits\n"
+                    "  - Backtick-quote identifiers that are reserved words\n"
+                    "  - Use standard MySQL JOIN syntax; no MindsDB-specific extensions"
+                ),
+                "postgres": (
+                    "PostgreSQL SQL rules you must follow:\n"
+                    "  - Use LIMIT N for row limits\n"
+                    "  - Double-quote identifiers only when necessary\n"
+                    "  - Use standard PostgreSQL syntax; no MindsDB-specific extensions"
+                ),
+            }
+            dialect_hint = _dialect_instructions.get(self.sql_dialect or "", "")
+            base_prompt += (
+                f"\n\nIMPORTANT: Your final answer MUST be a SQL query (type=final_query) "
+                f"compatible with the target database ({self.sql_dialect or 'mindsdb'}). "
+                + (f"\n{dialect_hint}\n" if dialect_hint else "")
+                + "The SQL query itself IS the final answer — do not wrap it in text or explanation."
+            )
 
         if select_targets_str is not None:
             base_prompt += f"\n\nFor the final query the user expects to have a table such that this query is valid: SELECT {select_targets_str} FROM (<generated query>); when generating the SQL query make sure to include those columns, do not fix grammar on columns. Keep them as the user wants them"
@@ -510,6 +686,8 @@ class PydanticAIAgent:
                     current_prompt,
                     message_history=message_history if message_history else None,
                 )
+                _au = result.usage()
+                logger.info(f"[TOKEN USAGE] loop#{exploratory_query_count}: request={_au.request_tokens}, response={_au.response_tokens}, total={_au.total_tokens}, details={_au.details}")
 
                 # Extract output
                 output = result.output
@@ -537,12 +715,21 @@ class PydanticAIAgent:
                     f"PydanticAIAgent._get_completion_stream: Received LLM response: sql: {sql_query}, query_type: {output.type}, description: {output.short_description}"
                 )
 
+                # return_sql_only mode: skip execution of the final query and return the SQL text as the answer
+                if output.type == ResponseType.FINAL_QUERY and self.return_sql_only:
+                    final_sql = self._apply_sql_dialect(sql_query)
+                    logger.info(f"return_sql_only=True (dialect={self.sql_dialect!r}): returning SQL as answer: {final_sql}")
+                    yield self._add_chunk_metadata({"type": "data", "text": final_sql})
+                    yield self._add_chunk_metadata({"type": "end"})
+                    return
+
                 try:
                     query_type = "final" if output.type == ResponseType.FINAL_QUERY else "exploratory"
                     yield self._add_chunk_metadata(
                         {"type": "status", "content": f"Executing {query_type} SQL query: {sql_query}"}
                     )
                     query_data = self.sql_toolkit.execute_sql(sql_query, escape_identifiers=True)
+                    logger.info(f"query_data columns={list(query_data.columns)}, rows={len(query_data)}, head=\n{query_data.head(2)}")
                 except Exception as e:
                     # Extract error message - prefer db_error_msg for QueryError, otherwise use str(e)
                     query_error = str(e)
@@ -570,6 +757,25 @@ class PydanticAIAgent:
                 retry_count = 0
 
                 if output.type == ResponseType.FINAL_QUERY:
+                    # If the final query returned 0 rows and we still have exploratory budget,
+                    # feed the empty result back so the LLM can revise its filters.
+                    if query_data.empty and exploratory_query_count < MAX_EXPLORATORY_QUERIES:
+                        logger.info("Final query returned 0 rows - feeding back as exploratory for filter revision")
+                        exploratory_query_count += 1
+                        yield self._add_chunk_metadata(
+                            {"type": "status", "content": "Final query returned 0 rows - asking agent to revise filters"}
+                        )
+                        query_result_str = (
+                            f"Query: {sql_query}\nDescription: {output.short_description}\n"
+                            f"Result: EMPTY (0 rows returned)\n"
+                            f"IMPORTANT: This query returned no results. Please re-examine the filter conditions. "
+                            f"Hint: date surrogate key columns (e.g. COMPL_DATE_SKEY, END_DATE_SKEY) use "
+                            f"20991231 as a sentinel meaning 'not yet completed / open record', not as a filter "
+                            f"for future-dated items. To find open/incomplete records filter for = 20991231; "
+                            f"to find completed records filter for < 20991231. Verify your filter logic and retry."
+                        )
+                        exploratory_query_results.append(query_result_str)
+                        continue
                     # return response to user
                     yield self._add_chunk_metadata({"type": "data", "content": query_data})
                     yield self._add_chunk_metadata({"type": "end"})

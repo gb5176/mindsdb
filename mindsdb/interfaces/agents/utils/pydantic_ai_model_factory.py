@@ -1,7 +1,20 @@
 """Pydantic AI model factory to create models from MindsDB configuration"""
 
+import asyncio
+import json
+import re
+import pandas as pd
 from typing import Dict, Any
+
+from pydantic_ai.models import Model
+from pydantic_ai.messages import (
+    ModelResponse, TextPart, ToolCallPart,
+    ModelRequest, ModelMessage, UserPromptPart, SystemPromptPart,
+    ToolReturnPart, RetryPromptPart,
+)
+
 from mindsdb.utilities import log
+from mindsdb.utilities.config import config as mindsdb_config
 from mindsdb.integrations.utilities.handler_utils import get_api_key
 from mindsdb.integrations.libs.llm.utils import get_llm_config
 from mindsdb.interfaces.agents.utils.constants import (
@@ -16,6 +29,200 @@ from mindsdb.interfaces.agents.utils.constants import (
 )
 
 logger = log.getLogger(__name__)
+
+_default_project = mindsdb_config.get('default_project', 'mindsdb')
+
+
+class MindsDBModel(Model):
+    """pydantic-ai Model that delegates inference to a MindsDB-managed predictor.
+
+    Supports structured output (output_tools) and function tool calling by injecting
+    JSON schema / tool definitions into the prompt and parsing the model's text response.
+    """
+
+    # Matches <tool_call>...</tool_call> blocks emitted by the underlying LLM.
+    _TOOL_CALL_RE = re.compile(r'<tool_call>\s*(\{.*?\})\s*</tool_call>', re.DOTALL)
+
+    def __init__(self, model_name: str, project_name: str = _default_project):
+        self._model_name = model_name
+        self._project_name = project_name
+        self._model_info = None
+        self._project_datanode = None
+
+    def _ensure_init(self):
+        if self._model_info is not None:
+            return
+        from mindsdb.api.executor.controllers import SessionController
+        session = SessionController()
+        self._model_info = session.model_controller.get_model(
+            self._model_name, project_name=self._project_name
+        )
+        self._project_datanode = session.datahub.get(self._project_name)
+
+    @property
+    def model_name(self) -> str:
+        return self._model_name
+
+    @property
+    def system(self) -> str:
+        return "mindsdb"
+
+    def _messages_to_text(self, messages: list[ModelMessage]) -> list[dict]:
+        """Convert pydantic-ai messages to role/content dicts."""
+        result = []
+        for msg in messages:
+            if isinstance(msg, ModelRequest):
+                for part in msg.parts:
+                    if isinstance(part, SystemPromptPart):
+                        result.append({"role": "system", "content": part.content})
+                    elif isinstance(part, UserPromptPart):
+                        content = part.content if isinstance(part.content, str) else str(part.content)
+                        result.append({"role": "user", "content": content})
+                    elif isinstance(part, ToolReturnPart):
+                        # Tool result returned to the model after a tool call
+                        content = part.content if isinstance(part.content, str) else str(part.content)
+                        result.append({
+                            "role": "user",
+                            "content": f'<tool_result name="{part.tool_name}">{content}</tool_result>',
+                        })
+                    elif isinstance(part, RetryPromptPart):
+                        content = part.content if isinstance(part.content, str) else str(part.content)
+                        result.append({"role": "user", "content": f"Retry: {content}"})
+            elif isinstance(msg, ModelResponse):
+                for part in msg.parts:
+                    if isinstance(part, TextPart):
+                        result.append({"role": "assistant", "content": part.content})
+                    elif isinstance(part, ToolCallPart):
+                        # Represent prior tool calls so the model has context
+                        args_str = part.args_as_json_str() if callable(getattr(part, 'args_as_json_str', None)) else str(part.args)
+                        result.append({
+                            "role": "assistant",
+                            "content": f'<tool_call>{{"name": "{part.tool_name}", "arguments": {args_str}}}</tool_call>',
+                        })
+        return result
+
+    @staticmethod
+    def _build_tool_instructions(function_tools, output_tools, allow_text_output: bool) -> str:
+        """Return a prompt suffix that describes available tools and required response format."""
+        lines = []
+
+        if function_tools:
+            lines.append("\n\nYou have access to the following tools:")
+            for tool in function_tools:
+                schema_str = json.dumps(tool.parameters_json_schema, indent=2)
+                lines.append(f'\n### Tool: {tool.name}\nDescription: {tool.description}\nParameters:\n{schema_str}')
+            lines.append(
+                '\n\nTo call a tool respond with ONLY a <tool_call> block (no other text):\n'
+                '<tool_call>\n{"name": "TOOL_NAME", "arguments": {ARGS_JSON}}\n</tool_call>'
+            )
+
+        if output_tools and not allow_text_output:
+            output_tool = output_tools[0]
+            schema_str = json.dumps(output_tool.parameters_json_schema, indent=2)
+            if function_tools:
+                lines.append(
+                    f'\n\nWhen you have the final answer call the "{output_tool.name}" tool:\n'
+                    f'<tool_call>\n{{"name": "{output_tool.name}", "arguments": {{...}}}}\n</tool_call>\n'
+                    f'Arguments schema:\n{schema_str}'
+                )
+            else:
+                lines.append(
+                    f'\n\nYou MUST respond with ONLY a valid JSON object — no markdown, no explanation.\n'
+                    f'The JSON must match this schema:\n{schema_str}'
+                )
+
+        return ''.join(lines)
+
+    @staticmethod
+    def _extract_json(text: str) -> str:
+        """Strip markdown code fences and return the bare JSON string."""
+        text = text.strip()
+        text = re.sub(r'^```(?:json)?\s*\n?', '', text)
+        text = re.sub(r'\n?```\s*$', '', text)
+        return text.strip()
+
+    async def request(self, messages, model_settings, model_request_parameters) -> ModelResponse:
+        from mindsdb.utilities.context import context as mindsdb_ctx
+
+        self._ensure_init()
+
+        msg_dicts = self._messages_to_text(messages)
+
+        output_tools = getattr(model_request_parameters, 'output_tools', [])
+        function_tools = getattr(model_request_parameters, 'function_tools', [])
+        allow_text_output = getattr(model_request_parameters, 'allow_text_output', True)
+        needs_structured = bool(output_tools or function_tools) and not allow_text_output
+
+        # Inject tool/schema instructions into the last user message.
+        if output_tools or function_tools:
+            instructions = self._build_tool_instructions(function_tools, output_tools, allow_text_output)
+            if instructions and msg_dicts:
+                msg_dicts[-1] = {**msg_dicts[-1], 'content': msg_dicts[-1]['content'] + instructions}
+
+        problem_definition = (self._model_info.get("problem_definition") or {}).get("using", {})
+        output_col = self._model_info.get("predict", "answer")
+        mode = problem_definition.get("mode", "conversational")
+
+        record: dict = {}
+        params: dict = {}
+
+        if mode in ("conversational", "retrieval"):
+            if self._model_info.get("engine") == "langchain":
+                params["mode"] = "chat_model"
+            user_column = problem_definition.get("user_column", "question")
+            if len(msg_dicts) > 1:
+                record[user_column] = "\n".join(
+                    f"{m['role']}: {m['content']}" for m in msg_dicts
+                )
+            else:
+                record[user_column] = msg_dicts[-1]["content"] if msg_dicts else ""
+        elif "column" in problem_definition:
+            record[problem_definition["column"]] = msg_dicts[-1]["content"] if msg_dicts else ""
+        else:
+            params["prompt_template"] = msg_dicts[-1]["content"] if msg_dicts else ""
+
+        ctx_dump = mindsdb_ctx.dump()
+        _model_name = self._model_name
+        _project_datanode = self._project_datanode
+        df = pd.DataFrame([record])
+
+        def run_predict():
+            mindsdb_ctx.load(ctx_dump)
+            return _project_datanode.predict(
+                model_name=_model_name,
+                df=df,
+                params=params,
+            )
+
+        loop = asyncio.get_running_loop()
+        predictions = await loop.run_in_executor(None, run_predict)
+
+        col = output_col if output_col in predictions.columns else predictions.columns[0]
+        result = str(predictions[col].iloc[0])
+
+        if needs_structured:
+            # 1. Try to find an explicit <tool_call> block.
+            match = self._TOOL_CALL_RE.search(result)
+            if match:
+                try:
+                    call = json.loads(match.group(1))
+                    return ModelResponse(
+                        parts=[ToolCallPart(tool_name=call['name'], args=call.get('arguments', {}))],
+                        model_name=self._model_name,
+                    )
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
+            # 2. No tagged block — if output tools are defined, treat the whole
+            #    response as the JSON payload for the first output tool.
+            if output_tools:
+                json_str = self._extract_json(result)
+                return ModelResponse(
+                    parts=[ToolCallPart(tool_name=output_tools[0].name, args=json_str)],
+                    model_name=self._model_name,
+                )
+
+        return ModelResponse(parts=[TextPart(content=result)], model_name=self._model_name)
 
 
 def get_llm_provider(args: Dict) -> str:
@@ -172,12 +379,18 @@ def get_pydantic_ai_model_kwargs(args: Dict[str, Any]) -> Dict[str, Any]:
             kwargs["base_url"] = base_url
 
     elif provider == "google":
-        # Try to get API key from args first, then from system config
-        api_key = args.get("google_api_key") or args.get("api_key")
-        if not api_key:
-            api_key = get_api_key("google", args, strict=False)
-        if api_key:
-            kwargs["api_key"] = api_key
+        # Vertex AI: project + location (credentials come from GOOGLE_APPLICATION_CREDENTIALS)
+        if args.get("project"):
+            kwargs["project"] = args["project"]
+        if args.get("location"):
+            kwargs["location"] = args["location"]
+        # Fall back to explicit API key only when not using Vertex AI
+        if not kwargs.get("project"):
+            api_key = args.get("google_api_key") or args.get("api_key")
+            if not api_key:
+                api_key = get_api_key("google", args, strict=False)
+            if api_key:
+                kwargs["api_key"] = api_key
 
     elif provider == "ollama":
         base_url = args.get("ollama_base_url") or args.get("base_url")
@@ -282,15 +495,24 @@ def get_model_instance_from_kwargs(args: Dict[str, Any]) -> Any:
             from pydantic_ai.models.google import GoogleModel
             from pydantic_ai.providers.google import GoogleProvider
 
-            # Extract API key
             api_key = model_kwargs.pop("api_key", None)
+            project = model_kwargs.pop("project", None)
+            location = model_kwargs.pop("location", None)
 
-            # Create provider with API key
-            if api_key:
-                google_provider = GoogleProvider(api_key=api_key)
+            provider_kwargs = {}
+            if project:
+                # Vertex AI mode: pass project + location; credentials come from
+                # GOOGLE_APPLICATION_CREDENTIALS env var (ADC) automatically.
+                provider_kwargs["project"] = project
+                if location:
+                    provider_kwargs["location"] = location
+            elif api_key:
+                provider_kwargs["api_key"] = api_key
+
+            if provider_kwargs:
+                google_provider = GoogleProvider(**provider_kwargs)
                 return GoogleModel(model_name, provider=google_provider, **model_kwargs)
             else:
-                # No custom provider needed, use default
                 return GoogleModel(model_name, **model_kwargs)
 
         elif provider == "ollama":
@@ -362,10 +584,8 @@ def get_model_instance_from_kwargs(args: Dict[str, Any]) -> Any:
             raise ValueError("Bedrock provider not yet supported for model instances")
 
         elif provider == "mindsdb":
-            # MindsDB custom provider - not yet supported for model instances
-            raise ValueError(
-                "MindsDB provider is not yet supported for model instances. Please use a different provider."
-            )
+            project_name = args.get("project_name", _default_project)
+            return MindsDBModel(model_name=model_name, project_name=project_name)
 
         else:
             raise ValueError(f"Unknown provider: {provider}")
