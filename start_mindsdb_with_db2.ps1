@@ -66,5 +66,14 @@ Write-Host "`nStarting MindsDB..." -ForegroundColor Yellow
 Write-Host "  Log file: $logFile" -ForegroundColor Green
 Write-Host "(Press Ctrl+C to stop)`n" -ForegroundColor Gray
 
-# Start MindsDB - output goes to both console and log file
-python -m mindsdb 2>&1 | Tee-Object -FilePath $logFile
+# Start MindsDB - show colored output on console, write clean UTF-8 to log file
+$utf8NoBOM = New-Object System.Text.UTF8Encoding $false
+$writer = New-Object System.IO.StreamWriter($logFile, $false, $utf8NoBOM)
+try {
+    python -m mindsdb 2>&1 | ForEach-Object {
+        Write-Host $_                                          # colored output to console
+        $writer.WriteLine(($_ -replace '\x1B\[[0-9;]*[mK]', ''))  # clean UTF-8 to file
+    }
+} finally {
+    $writer.Close()
+}
