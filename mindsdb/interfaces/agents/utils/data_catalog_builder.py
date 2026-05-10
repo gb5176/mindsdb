@@ -95,7 +95,7 @@ def dataframe_to_markdown(df: pd.DataFrame) -> str:
 class DataCatalogBuilder:
     """Builds and caches data catalogs for agent data sources"""
 
-    def __init__(self, sql_toolkit, disable_cache: bool = False, sample_rows: int = 5, include_metadata: bool = True):
+    def __init__(self, sql_toolkit, disable_cache: bool = False, sample_rows: int = 5, include_metadata: bool = True, exclude_kbs: list = None):
         """
         Initialize data catalog builder.
 
@@ -104,12 +104,15 @@ class DataCatalogBuilder:
             sample_rows: Number of sample rows per table. Set to 0 to skip sample
                          data entirely (column schema is still shown).
             include_metadata: If False, skip SHOW COLUMNS fetch (use when KBs supply column info).
+            exclude_kbs: KB names (bare, no project prefix) to exclude from the catalog.
+                         Used to hide specialised KBs (e.g. sql_cache) from the LLM.
         """
         self.sql_toolkit = sql_toolkit
         self.cache = get_cache("agent", max_size=_MAX_CACHE_SIZE)
         self.disable_cache = disable_cache
         self.sample_rows = sample_rows
         self.include_metadata = include_metadata
+        self._exclude_kbs = {str(k).split(".")[-1].lower() for k in (exclude_kbs or []) if k}
 
     def _get_cache_key(
         self,
@@ -277,7 +280,10 @@ class DataCatalogBuilder:
             CSV-formatted string containing the complete data catalog
         """
         tables = self.sql_toolkit.get_usable_table_names()
-        knowledge_bases = self.sql_toolkit.get_usable_knowledge_base_names()
+        knowledge_bases = [
+            kb for kb in self.sql_toolkit.get_usable_knowledge_base_names()
+            if str(kb).split(".")[-1].lower() not in self._exclude_kbs
+        ]
 
         # Disable cache if instance flag is set
         if self.disable_cache:

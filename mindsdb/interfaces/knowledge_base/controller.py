@@ -67,6 +67,7 @@ class KnowledgeBaseInputParams(BaseModel):
     vector_size: int | None = None
     reranking_model: Union[Dict[Text, Any], bool] | None = None
     preprocessing: Dict[Text, Any] | None = None
+    kb_type: str | None = None  # role hint for agents: 'schema' (default) | 'sql_cache' | future types
 
     class Config:
         extra = "forbid"

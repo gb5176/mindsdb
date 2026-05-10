@@ -98,10 +98,14 @@ class PydanticAIAgent:
         # with dialect-specific transformations applied.  "mindsdb" (or absent) preserves normal
         # execute-and-return-data behaviour.
         self.sql_dialect = self.agent.params.get("sql_dialect", None)
-        # return_sql_only: skip execution and return the SQL as the answer.
-        # Auto-enabled when mode=sql (existing behaviour) OR when sql_dialect is explicitly set.
-        _dialect_implies_sql = self.sql_dialect is not None and self.sql_dialect != "mindsdb"
-        self.return_sql_only = self.agent.params.get("return_sql", self.agent_mode == "sql" or _dialect_implies_sql)
+        # return_sql_only: skip execution and return the SQL text as the answer.
+        # Driven solely by mode='sql' — sql_dialect is independent (controls syntax only).
+        self.return_sql_only = self.agent_mode == "sql"
+        # sql_cache_kb: explicit param takes precedence (backward compat).
+        # If not set, auto-detected after sql_toolkit is built by checking each KB's stored kb_type.
+        self.sql_cache_kb = self.agent.params.get("sql_cache_kb", None)
+        self.sql_cache_min_relevance = float(self.agent.params.get("sql_cache_min_relevance", 0.7))
+        self.sql_cache_max_examples = int(self.agent.params.get("sql_cache_max_examples", 3))
 
         self.llm_params = llm_params
 
@@ -134,6 +138,25 @@ class PydanticAIAgent:
                     knowledge_bases_list.append(source)
 
         self.sql_toolkit = MindsDBQuery(tables_list, knowledge_bases_list)
+
+        # Auto-detect sql_cache_kb from KB metadata if not explicitly set.
+        # KBs created with USING kb_type='sql_cache' are identified here and excluded from
+        # schema pre-fetch and the LLM data catalog — used only for few-shot injection.
+        if not self.sql_cache_kb:
+            _project_id = getattr(self.agent, "project_id", None)
+            _session = self.sql_toolkit.command_executor.session
+            for _kb_name in knowledge_bases_list:
+                _kb_bare = str(_kb_name).split(".")[-1]
+                try:
+                    _kb_rec = _session.kb_controller.get(_kb_bare, _project_id)
+                    if _kb_rec and (_kb_rec.params or {}).get("kb_type") == "sql_cache":
+                        self.sql_cache_kb = _kb_bare
+                        logger.info(f"sql_cache_kb auto-detected via kb_type: {self.sql_cache_kb!r}")
+                        break
+                except Exception:
+                    pass
+
+        logger.info(f"[SQL CACHE] sql_cache_kb={self.sql_cache_kb!r}  agent_params_keys={list(self.agent.params.keys())}")
 
         self.system_prompt = self.agent.params.get("prompt_template", "You are an expert MindsDB SQL data analyst")
 
@@ -496,8 +519,11 @@ class PydanticAIAgent:
         """
         _MAX_CHUNK_CHARS = 300  # truncate each chunk to keep snippets concise
         _MAX_TOTAL_CHARS = 3000  # hard cap on total injected KB context
+        _cache_kb_bare = (self.sql_cache_kb or "").split(".")[-1].lower()
         parts = []
         for kb in self.sql_toolkit.get_usable_knowledge_base_names():
+            if _cache_kb_bare and str(kb).split(".")[-1].lower() == _cache_kb_bare:
+                continue  # sql_cache KB is not a schema source — skip pre-fetch
             kb_query = ast.Select(
                 targets=[ast.Star()],
                 from_table=kb,
@@ -521,6 +547,135 @@ class PydanticAIAgent:
             full = full[:_MAX_TOTAL_CHARS] + "\n... (truncated)"
         return full
 
+    def _fetch_similar_sql_examples(self, question: str) -> str:
+        """Retrieve semantically similar approved (question → SQL) pairs from the cache KB."""
+        if not self.sql_cache_kb:
+            return ""
+        try:
+            from mindsdb.utilities.context import context as ctx
+            tenant_id = str(getattr(ctx, "company_id", "") or "")
+
+            cache_query = ast.Select(
+                targets=[ast.Star()],
+                from_table=ast.Identifier(self.sql_cache_kb),
+                where=ast.BinaryOperation(
+                    "AND",
+                    args=[
+                        ast.BinaryOperation(
+                            "AND",
+                            args=[
+                                ast.BinaryOperation(
+                                    "LIKE",
+                                    args=[ast.Identifier("content"), ast.Constant(question)]
+                                ),
+                                ast.BinaryOperation(
+                                    ">=",
+                                    args=[ast.Identifier("relevance"), ast.Constant(self.sql_cache_min_relevance)]
+                                ),
+                            ]
+                        ),
+                        ast.BinaryOperation(
+                            "=",
+                            args=[ast.Identifier("tenant_id"), ast.Constant(tenant_id)]
+                        ),
+                    ]
+                ),
+                limit=ast.Constant(self.sql_cache_max_examples),
+            )
+            result = self.sql_toolkit.execute(cache_query)
+            if result is None or result.empty:
+                return ""
+
+            examples = []
+            for _, row in result.iterrows():
+                # KB stores embedded text as 'chunk_content'; 'content' is only a WHERE search trigger
+                q = str(row.get("chunk_content", "") or row.get("content", "")).strip()
+                sql = str(row.get("sql_query", "")).strip()
+                if q and sql and sql.upper() != "NONE":
+                    examples.append(f"Question: {q}\nSQL:\n{sql}")
+
+            if not examples:
+                return ""
+
+            logger.info(f"SQL cache: {len(examples)} similar example(s) found for prompt injection")
+            return (
+                "=== Past Similar SQL Queries (REFERENCE ONLY — DO NOT COPY VERBATIM) ===\n"
+                "Adapt these for the current question. Verify column names against the data catalog.\n"
+                "If a past example contradicts the catalog, TRUST THE CATALOG.\n\n"
+                + "\n\n---\n\n".join(examples)
+            )
+
+        except Exception as e:
+            logger.warning(f"SQL cache fetch failed (non-critical): {type(e).__name__}: {e}")
+            return ""
+
+    def _stage_query_example(self, question: str, sql: str) -> None:
+        """Write a (question → SQL) pair to the local staging JSONL file for manual review.
+
+        Nothing is inserted into the KB automatically. The user must run the logged INSERT
+        command to approve and promote an entry to the KB.
+        Runs in a background daemon thread — zero latency to the user.
+        """
+        if not self.sql_cache_kb:
+            return
+
+        kb = self.sql_cache_kb
+        dialect = self.sql_dialect or "mindsdb"
+
+        def _do_stage():
+            try:
+                import json
+                import os
+                import uuid
+                from datetime import datetime, timezone
+                from mindsdb.utilities.context import context as ctx
+
+                tenant_id = str(getattr(ctx, "company_id", "") or "")
+                user_id = str(getattr(ctx, "user_id", "") or "")
+                entry_id = str(uuid.uuid4())[:8]
+                created_at = datetime.now(timezone.utc).isoformat()
+
+                # Resolve MindsDB data root for staging file location
+                try:
+                    from mindsdb.utilities.config import Config
+                    root = str(Config().paths.get("root", os.path.expanduser("~/.mindsdb")))
+                except Exception:
+                    root = os.path.expanduser("~/.mindsdb")
+                os.makedirs(root, exist_ok=True)
+                staging_path = os.path.join(root, "sql_cache_staging.jsonl")
+
+                entry = {
+                    "id": entry_id,
+                    "question": question,
+                    "sql_query": sql,
+                    "dialect": dialect,
+                    "tenant_id": tenant_id,
+                    "user_id": user_id,
+                    "created_at": created_at,
+                }
+
+                # One JSON object per line — safe for concurrent appends
+                with open(staging_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry) + "\n")
+
+                safe_q = question.replace("'", "''")
+                safe_sql = sql.replace("'", "''")
+                logger.info(
+                    f"SQL cache staged [{entry_id}]: '{question[:60]}...'\n"
+                    f"  Staging file: {staging_path}\n"
+                    f"  To approve this entry, run:\n"
+                    f"    INSERT INTO {kb} (content, sql_query, dialect, tenant_id, user_id, created_at)\n"
+                    f"    VALUES ('{safe_q}', '{safe_sql}', '{dialect}',\n"
+                    f"            '{tenant_id}', '{user_id}', '{created_at}');"
+                )
+            except Exception as e:
+                # Bumped from debug → warning so failures are visible in default log level.
+                logger.warning(f"SQL cache staging failed (non-critical): {type(e).__name__}: {e}")
+
+        import threading
+        logger.info(f"SQL cache: launching stage thread for kb={kb!r}, question_len={len(question)}, sql_len={len(sql)}")
+        threading.Thread(target=_do_stage, daemon=True).start()
+
     @langfuse_traced_stream(trace_name="api-completion", span_name="run-completion")
     def _get_completion_stream(self, messages: List[dict], params) -> Iterable[Dict]:
         """
@@ -537,6 +692,9 @@ class PydanticAIAgent:
         # Extract current prompt and message history from messages
         # This handles multiple formats: list of dicts, DataFrame with role/content, or legacy DataFrame
         current_prompt, message_history = self._extract_current_prompt_and_history(messages, params)
+        # Save the original user question — current_prompt is later overwritten with base_prompt
+        # in the execution loop. Staging and the approve command need the original short question.
+        original_question = current_prompt
         DEBUG_LOGGER(
             f"PydanticAIAgent._get_completion_stream: Extracted prompt and {len(message_history)} history messages"
         )
@@ -550,21 +708,44 @@ class PydanticAIAgent:
             agent_prompts = sql_mode
             AgentResponse = sql_mode.AgentResponse
 
-        if self.sql_toolkit.knowledge_bases:
+        # Skip MindsDB-specific SQL instructions when targeting a non-MindsDB dialect —
+        # the dialect rules injected into base_prompt replace them entirely.
+        _skip_mindsdb_instructions = self.return_sql_only and self.sql_dialect not in (None, "mindsdb")
+        if _skip_mindsdb_instructions:
+            sql_instructions = ""
+        elif self.sql_toolkit.knowledge_bases:
             sql_instructions = f"{agent_prompts.sql_description}\n\n{agent_prompts.sql_with_kb_description}"
         else:
             sql_instructions = agent_prompts.sql_description
 
-        # When KBs are present: use fewer sample rows and skip SHOW COLUMNS metadata
-        # (the KB pre-fetch below supplies focused column info, avoiding ~500 tokens/table overhead).
+        # When KBs are present: use fewer sample rows (KB pre-fetch supplies focused column info).
+        # Always include SHOW COLUMNS metadata — omitting it causes the LLM to hallucinate
+        # column names for tables whose columns aren't semantically close to the question.
         _has_kbs = bool(self.sql_toolkit.knowledge_bases)
         _sample_rows = 3 if _has_kbs else 5
-        _include_metadata = not _has_kbs
-        data_catalog = DataCatalogBuilder(
+        _include_metadata = True
+        import contextvars
+        from concurrent.futures import ThreadPoolExecutor
+
+        catalog_builder = DataCatalogBuilder(
             sql_toolkit=self.sql_toolkit,
             sample_rows=_sample_rows,
             include_metadata=_include_metadata,
-        ).build_data_catalog()
+            exclude_kbs=[self.sql_cache_kb] if self.sql_cache_kb else None,
+        )
+
+        if _has_kbs:
+            # Catalog build and KB pre-fetch are independent — overlap them to save ~3-5 sec.
+            # Each thread needs its own context copy — a single Context object cannot be entered
+            # by two threads simultaneously.
+            with ThreadPoolExecutor(max_workers=2) as _pool:
+                _f_catalog = _pool.submit(contextvars.copy_context().run, catalog_builder.build_data_catalog)
+                _f_kb = _pool.submit(contextvars.copy_context().run, self._fetch_kb_context, current_prompt)
+            data_catalog = _f_catalog.result()
+            _kb_prefetch = _f_kb.result()
+        else:
+            data_catalog = catalog_builder.build_data_catalog()
+            _kb_prefetch = ""
 
         # Initialize counters and accumulators
         exploratory_query_count = 0
@@ -581,14 +762,14 @@ class PydanticAIAgent:
         # Build planning prompt
         planning_prompt_text = f"""Take into account the following Data Catalog:\n{data_catalog}\n\n{agent_prompts.planning_prompt}\n\nQuestion to answer: {current_prompt}"""
 
-        # When KBs are present, pre-fetch relevant schema/column context and inject into the planning prompt.
-        # This makes KBs actively useful for the planning step and compensates for skipping SHOW COLUMNS above.
-        if _has_kbs:
-            yield self._add_chunk_metadata({"type": "status", "content": "Querying knowledge bases for schema context..."})
-            kb_context = self._fetch_kb_context(current_prompt)
-            if kb_context:
-                planning_prompt_text += f"\n\n=== Knowledge Base Context (schema / column info) ===\n{kb_context}"
-                logger.info(f"KB pre-fetch injected {len(kb_context)} chars into planning prompt")
+        # Inject KB context collected in parallel with the catalog build
+        if _kb_prefetch:
+            planning_prompt_text += f"\n\n=== Knowledge Base Context (schema / column info) ===\n{_kb_prefetch}"
+            logger.info(f"KB pre-fetch injected {len(_kb_prefetch)} chars into planning prompt")
+        _sql_examples = self._fetch_similar_sql_examples(current_prompt)
+        if _sql_examples:
+            planning_prompt_text += f"\n\n{_sql_examples}"
+            logger.info(f"SQL cache: injected {len(_sql_examples)} chars of examples into planning prompt")
         DEBUG_LOGGER(f"PydanticAIAgent._get_completion_stream: Planning prompt text: {planning_prompt_text}")
         # Get select targets for planning context
 
@@ -622,18 +803,30 @@ class PydanticAIAgent:
         )
 
         # Build base prompt with plan included
-        base_prompt = f"\n\nTake into account the following Data Catalog:\n{data_catalog}\nMindsDB SQL instructions:\n{sql_instructions}\n\nProposed Execution Plan:\n{plan.plan}\n\nEstimated steps: {plan.estimated_steps} (maximum allowed: {MAX_EXPLORATORY_QUERIES})\n\nPlease follow this plan and write Mindsdb SQL queries to answer the question:\n{current_prompt}"
+        _sql_instr_block = f"MindsDB SQL instructions:\n{sql_instructions}\n\n" if sql_instructions else ""
+        base_prompt = (
+            f"\n\nTake into account the following Data Catalog:\n{data_catalog}\n"
+            f"{_sql_instr_block}"
+            f"Proposed Execution Plan:\n{plan.plan}\n\n"
+            f"Estimated steps: {plan.estimated_steps} (maximum allowed: {MAX_EXPLORATORY_QUERIES})\n\n"
+            f"Please follow this plan and write Mindsdb SQL queries to answer the question:\n{current_prompt}"
+        )
 
         if self.return_sql_only:
             _dialect_instructions = {
                 "db2": (
-                    "DB2 SQL rules you must follow:\n"
-                    "  - Use FETCH FIRST N ROWS ONLY instead of LIMIT N\n"
-                    "  - Never use backtick quotes (`) for identifiers — use plain uppercase names\n"
-                    "  - Table names must be fully qualified as SCHEMA.TABLE (e.g. COGUSER.RAR_PROJECT)\n"
-                    "  - Do NOT include the MindsDB connection name prefix "
-                    "(e.g. aar_db2.COGUSER.TABLE is WRONG — use COGUSER.TABLE)\n"
-                    "  - Use standard SQL JOIN syntax; no MindsDB-specific extensions"
+                    "This agent targets a DB2 database. Write ALL queries in standard MindsDB SQL "
+                    "format — the system automatically converts the final answer to DB2 syntax "
+                    "(FETCH FIRST, 2-part names, uppercase identifiers).\n"
+                    "Rules:\n"
+                    "  - For ALL queries (exploratory and final): use the EXACT 3-part table name "
+                    "from the data catalog, including the connection name prefix "
+                    "(e.g. aar_db2_minddb_connection_knl01pt_v1.coguser.RAR_PROJECT).\n"
+                    "  - If a knowledge base result shows a 2-part table name like "
+                    "'coguser.rar_proj_execution', find the matching 3-part name in the data "
+                    "catalog and use that.\n"
+                    "  - Use LIMIT N for row limits (not FETCH FIRST) — it will be converted automatically.\n"
+                    "  - Use standard SQL JOIN syntax; no MindsDB-specific extensions."
                 ),
                 "mysql": (
                     "MySQL SQL rules you must follow:\n"
@@ -658,6 +851,18 @@ class PydanticAIAgent:
 
         if select_targets_str is not None:
             base_prompt += f"\n\nFor the final query the user expects to have a table such that this query is valid: SELECT {select_targets_str} FROM (<generated query>); when generating the SQL query make sure to include those columns, do not fix grammar on columns. Keep them as the user wants them"
+
+        if _has_kbs:
+            base_prompt += (
+                "\n\nKNOWLEDGE BASE QUERY RULES:\n"
+                "- Column schema info is already in the data catalog above — do NOT query a knowledge base "
+                "just to discover table structure or column names.\n"
+                "- When you DO query a knowledge base, ALWAYS include a specific "
+                "WHERE content LIKE '<search term>' filter AND add FETCH FIRST 10 ROWS ONLY "
+                "(or LIMIT 10 for MindsDB-side queries) to avoid retrieving too many rows.\n"
+                "- Knowledge base results may show 2-part table names (e.g. 'coguser.rar_proj_execution'). "
+                "Always match these to the full 3-part name in the data catalog before using them in SQL."
+            )
 
         DEBUG_LOGGER(
             f"PydanticAIAgent._get_completion_stream: Sending LLM request with Current prompt: {current_prompt}"
@@ -719,7 +924,45 @@ class PydanticAIAgent:
                 if output.type == ResponseType.FINAL_QUERY and self.return_sql_only:
                     final_sql = self._apply_sql_dialect(sql_query)
                     logger.info(f"return_sql_only=True (dialect={self.sql_dialect!r}): returning SQL as answer: {final_sql}")
-                    yield self._add_chunk_metadata({"type": "data", "text": final_sql})
+                    # If SQL cache is configured, append the approve command directly to the SQL response
+                    # as a comment block so the user always sees it (UI may drop separate 'context' chunks).
+                    response_text = final_sql
+                    if self.sql_cache_kb:
+                        from mindsdb.utilities.context import context as ctx
+                        from datetime import datetime, timezone
+                        _tenant_id = str(getattr(ctx, "company_id", "") or "")
+                        _user_id = str(getattr(ctx, "user_id", "") or "")
+                        _created_at = datetime.now(timezone.utc).isoformat()
+                        _safe_q = original_question.replace("'", "''")
+                        # INSERT stores MindsDB SQL (pre-dialect) so the cache entry works for
+                        # both mode='sql' and mode='text'. The answer returned to the user
+                        # (response_text) still uses final_sql (DB2 format).
+                        _safe_sql = sql_query.replace("'", "''")
+                        _dialect = "mindsdb"
+                        # Runnable INSERT — copy/paste directly from the log to approve.
+                        _runnable_insert = (
+                            f"INSERT INTO {self.sql_cache_kb} "
+                            f"(content, sql_query, dialect, tenant_id, user_id, created_at) "
+                            f"VALUES ('{_safe_q}', '{_safe_sql}', '{_dialect}', "
+                            f"'{_tenant_id}', '{_user_id}', '{_created_at}');"
+                        )
+                        logger.info(
+                            "===== SQL CACHE: copy/paste the INSERT below to approve this query for future reuse =====\n"
+                            f"{_runnable_insert}\n"
+                            "===== END SQL CACHE INSERT ====="
+                        )
+                        # Also append a commented version to the SQL response (UI fallback).
+                        _approve_cmd = (
+                            f"\n\n-- ===== To save this query for future use, run the INSERT below: =====\n"
+                            f"-- {_runnable_insert}"
+                        )
+                        response_text = final_sql + _approve_cmd
+                        logger.info(f"SQL cache: appended approve command ({len(_approve_cmd)} chars) to response")
+                    # Stage BEFORE the final yields — if the consumer closes the generator after
+                    # receiving "end", any code after the last yield is skipped (GeneratorExit).
+                    # The daemon thread launched by _stage_query_example runs independently afterwards.
+                    self._stage_query_example(original_question, sql_query)  # MindsDB SQL, not DB2
+                    yield self._add_chunk_metadata({"type": "data", "text": response_text})
                     yield self._add_chunk_metadata({"type": "end"})
                     return
 
@@ -776,6 +1019,9 @@ class PydanticAIAgent:
                         )
                         exploratory_query_results.append(query_result_str)
                         continue
+                    # mode='text': sql_query is MindsDB-format SQL (3-part names, LIMIT N) — safe to cache.
+                    # Stage BEFORE yields to avoid GeneratorExit silently skipping this call.
+                    self._stage_query_example(original_question, sql_query)
                     # return response to user
                     yield self._add_chunk_metadata({"type": "data", "content": query_data})
                     yield self._add_chunk_metadata({"type": "end"})
@@ -787,8 +1033,17 @@ class PydanticAIAgent:
                 DEBUG_LOGGER(debug_message)
                 yield self._add_chunk_metadata({"type": "status", "content": debug_message})
 
-                # Format query result for prompt
+                # Format query result for prompt — cap at 3000 chars to prevent
+                # wide/long results (e.g. SELECT * on a 100-column table) from permanently
+                # bloating the context window across all subsequent loops.
                 markdown_table = dataframe_to_markdown(query_data)
+                _MAX_RESULT_CHARS = 3000
+                if len(markdown_table) > _MAX_RESULT_CHARS:
+                    markdown_table = (
+                        markdown_table[:_MAX_RESULT_CHARS]
+                        + f"\n... [truncated — {len(query_data)} row(s), {len(query_data.columns)} column(s) total; "
+                        "use SELECT with specific columns to get a focused result]"
+                    )
                 query_result_str = (
                     f"Query: {sql_query}\nDescription: {output.short_description}\nResult:\n{markdown_table}"
                 )

@@ -215,8 +215,23 @@ class MindsDBQuery:
         If the statement returns no rows, an empty string is returned.
         """
 
-        if isinstance(query, Select) and query.limit is None:
-            query.limit = Constant(100)
+        if isinstance(query, Select):
+            from_table = query.from_table
+            is_kb = (
+                isinstance(from_table, Identifier)
+                and bool(self.knowledge_bases)
+                and self.knowledge_bases.match(from_table)
+            )
+            # KB semantic search: hard cap at 25 rows regardless of what the LLM sets.
+            # 10 was too few — the LLM compensated with 19+ loops to gather schema info,
+            # which is slower than allowing more rows per query.  25 is enough to return
+            # meaningful column context while preventing the 154-row explosion seen before.
+            # Regular table exploratory queries: cap at 20 rows when no limit is set.
+            _max_rows = 25 if is_kb else 20
+            if query.limit is None:
+                query.limit = Constant(_max_rows)
+            elif isinstance(query.limit, Constant) and isinstance(query.limit.value, int) and query.limit.value > _max_rows:
+                query.limit = Constant(_max_rows)
         query = copy.deepcopy(query)
         ret = self.command_executor.execute_command(query)
         if ret.error_code is not None:
